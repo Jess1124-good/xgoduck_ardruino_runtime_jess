@@ -88,6 +88,9 @@ class Controller:
         self.arm_pending = False
         self.seq = self.received = self.inferred = self.sent = self.bad_frames = self.gaps = 0
         self.last_error = ''
+        # Short history of disarms/errors with uptime, so a later message does
+        # not hide what actually dropped torque (a B press used to erase it).
+        self.event_log = collections.deque(maxlen=24)
         self.stop_event = threading.Event()
         self.rx_times = collections.deque(maxlen=1000)
         self.infer_times = collections.deque(maxlen=500)
@@ -190,6 +193,7 @@ class Controller:
                     self._stop_pick_locked(); self._stop_roulade_locked()
                     self._zeros_pushed = False
                     self._zeros_confirmed = False
+                    self._note('MCU sequence restarted; dropped to inference only')
                 else:
                     self.gaps += step-1
                 self.rx_intervals.append((now-self.rx_time)*1000)
@@ -197,6 +201,9 @@ class Controller:
                 timestamp=now, imu_ok=fb.imu_ok)
             self.feedback, self.rx_time = fb, now
             self.received += 1; self.rx_times.append(now)
+            if old and old.enabled and not fb.enabled and self.mode in ('hold', 'policy'):
+                # The firmware cut torque on its own: command TTL or IMU watchdog.
+                self._note('MCU cut torque while a mode was commanding it (TTL/IMU watchdog)')
 
     def _require_feedback(self, mask):
         fb = self.feedback
@@ -404,11 +411,17 @@ class Controller:
             self.web_time = time.monotonic()
         return {'ok': True}
 
+    def _note(self, message):
+        """Record a disarm/error with uptime so the newest message cannot hide it."""
+        self.last_error = message
+        self.event_log.append(dict(t=round(time.monotonic()-self.started, 2),
+                                   mode=self.mode, message=message))
+
     def _stop_gamepad_locked(self, reason):
         self.set_mode('off')
         self.twist = [0.0]*3
         self._disarm_now()
-        self.last_error = reason
+        self._note(reason)
 
     def gamepad(self, action, session=None, seq=0, twist=None, device='', sent_at=None):
         """Host joystick transport; sessions prevent stale clients taking over.
@@ -577,7 +590,7 @@ class Controller:
 
     def _startup_pose_inputs_ready(self, now):
         fb, filt = self.feedback, self.filtered
-        return bool(self.mode == 'shadow' and fb and now-self.rx_time < .15
+        return bool(self.mode in ('shadow', 'off') and fb and now-self.rx_time < .15
                     and fb.imu_ok and fb.mask == ALL_MASK
                     and not fb.calibrating and not fb.servo_debugging
                     and filt and filt['imu_fusion_ready'] and filt['imu_fusion_updated']
@@ -587,9 +600,11 @@ class Controller:
         """Track whether the robot is safe to stand up. It never moves the motors.
 
         Torque is only enabled by an explicit request (gamepad X, or Default pose
-        in the page), so a booting board cannot stand itself up unattended.
+        in the page), so a booting board cannot stand itself up unattended. A
+        request is repeatable: after B or Torque off the operator can ask again.
         """
-        if not self.startup_pose_pending:
+        if self.startup_pose_active:
+            self.startup_pose_ready_since = None
             return
         if not self._startup_pose_inputs_ready(now):
             self.startup_pose_ready_since = None
@@ -600,22 +615,21 @@ class Controller:
     def startup_pose_ready(self):
         """True once every servo, the IMU and the saved zero table held for the settle time."""
         now = time.monotonic()
-        return (self.startup_pose_pending and self._startup_pose_inputs_ready(now)
+        return (not self.startup_pose_active and self._startup_pose_inputs_ready(now)
                 and self.startup_pose_ready_since is not None
                 and now-self.startup_pose_ready_since >= STARTUP_POSE_SETTLE_S)
 
     def enter_startup_pose(self):
         """Enable torque into the default pose. Requires an explicit operator request."""
         with self.lock:
-            if not self.startup_pose_pending:
+            if self.startup_pose_active and self.mode == 'hold':
                 return {'ok': True, 'already': True, 'mode': self.mode}
             if not self.startup_pose_ready():
                 raise ValueError('default pose not ready: wait for 15 servos, IMU and saved calibration')
-            if self.mode != 'shadow':
-                raise ValueError(f'default pose needs inference-only mode, current is {self.mode}')
             self.set_mode('hold')
             # set_mode clears both flags; keep the pose alive without a browser.
             self.startup_pose_active = True
+            self.startup_pose_pending = False
             print('Startup: default pose enabled on request; press A to walk, B for torque off', flush=True)
             return {'ok': True, 'mode': self.mode}
 
@@ -640,7 +654,7 @@ class Controller:
                     self.gamepad_session = None
                     self.twist = [0.0]*3
                     self.mode = mode = 'shadow'; self.generation += 1
-                    self.arm_pending = False; self.last_error = lost
+                    self.arm_pending = False; self._note(lost)
                     generation = self.generation
                     self.recovery.reset(); self.policy_needs_reset = True
                     self._stop_pick_locked(); self._stop_roulade_locked()
@@ -648,7 +662,7 @@ class Controller:
                 if time.monotonic()-self.web_time > 2.0:
                     previous = mode
                     self.mode = mode = 'shadow'; self.generation += 1
-                    self.last_error = 'calibrate/servo_debug heartbeat lost; exited'
+                    self._note('calibrate/servo_debug heartbeat lost; exited')
                     generation = self.generation
                     if previous == 'calibrate':
                         self.cal_done = [False]*15
@@ -780,7 +794,8 @@ class Controller:
                     self.startup_pose_pending = self.startup_pose_active = False
                     self.gamepad_session = None
                     self.twist = [0.0]*3
-                    self.last_error = str(exc); self.mode = 'off'; self.generation += 1; self.arm_pending = False
+                    self.mode = 'off'; self.generation += 1; self.arm_pending = False
+                    self._note(str(exc))
                     self._stop_pick_locked(); self._stop_roulade_locked()
             deadline += CONTROL_PERIOD
             now = time.monotonic()
@@ -854,6 +869,7 @@ class Controller:
             result['startup_pose'] = dict(pending=self.startup_pose_pending,
                 ready=self.startup_pose_ready(), active=self.startup_pose_active,
                 settle_s=STARTUP_POSE_SETTLE_S, zeros_confirmed=self._zeros_confirmed)
+            result['error_history'] = list(self.event_log)
             result['board_gamepad'] = dict(active=self.gamepad_session is not None,
                 device=self.gamepad_device,
                 age_ms=(now-self.gamepad_time)*1000 if self.gamepad_time else None,
