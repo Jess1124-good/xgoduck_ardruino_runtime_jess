@@ -25,8 +25,9 @@ ABS_X, ABS_Y, ABS_Z, ABS_RX = 0, 1, 2, 3
 BTN_A, BTN_B, BTN_X, BTN_LB = 0x130, 0x131, 0x133, 0x136
 
 # Command peaks before --speed scaling. Forward keeps the training range; the
-# robot falls after a few backward steps at -0.4, so reverse is capped at half.
-VX_FORWARD, VX_BACKWARD = 0.4, 0.2
+# robot falls after a few backward steps at -0.4, while -0.2 is too weak to
+# break stiction on carpet, so reverse sits at -0.3.
+VX_FORWARD, VX_BACKWARD = 0.4, 0.3
 VY_PEAK, WZ_PEAK = 0.3, 1.0
 
 
