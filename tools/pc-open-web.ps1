@@ -25,8 +25,13 @@ if ($devices.Count -eq 0) {
     throw "No authorized device. Check the USB cable, board power, and Arduino App Lab."
 }
 
-# 重新建立转发（先清掉旧的，避免 "Address already in use"）
-& $adb forward --remove "tcp:$LocalPort" 2>$null | Out-Null
+# 重新建立转发（先清掉旧的，避免 "Address already in use"）。
+# 监听不存在时 adb 会往 stderr 写一行并返回非零，PowerShell 5.1 在
+# ErrorActionPreference=Stop 下会把它当终止性错误，这里临时放宽。
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+& $adb forward --remove "tcp:$LocalPort" 2>&1 | Out-Null
+$ErrorActionPreference = $prevEap
 & $adb forward "tcp:$LocalPort" "tcp:$RemotePort" | Out-Null
 
 $url = "http://127.0.0.1:$LocalPort/"

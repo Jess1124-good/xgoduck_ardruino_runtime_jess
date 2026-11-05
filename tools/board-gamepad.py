@@ -92,7 +92,7 @@ class Joystick:
 
 
 class InputGate:
-    def __init__(self, speed=0.5):
+    def __init__(self, speed=1.0):
         self.speed = speed
         self.ready = self.a_down = self.x_down = False
 
@@ -242,7 +242,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--mac', required=True, help='paired controller Bluetooth address')
     parser.add_argument('--device', default='', help='optional /dev/input/jsN; identity is still verified')
-    parser.add_argument('--speed', type=float, choices=(.25, .5, 1.0), default=.5)
+    parser.add_argument('--speed', type=float, choices=(.25, .5, 1.0), default=1.0,
+                        help='peak command scale; 1.0 matches the web joystick (vx 0.4, vy 0.3, wz 1.0)')
     parser.add_argument('--url', default='http://127.0.0.1:9527')
     parser.add_argument('--run', action='store_true', help='send control to App; default only prints inputs')
     parser.add_argument('--reconnect', action='store_true', help='retry Bluetooth connection to this already paired/trusted controller')
@@ -267,6 +268,10 @@ def main():
     print('CONTROL: press X for the default pose, then release LB and center sticks and press A to walk; '
           'hold LB to move; B stops torque.'
           if client else 'PREVIEW ONLY: no API calls or motor commands. Move sticks and press A/B/X/LB.', flush=True)
+    print(f'Peak command at --speed {args.speed}: vx +-{0.4*args.speed:.2f}  vy +-{0.3*args.speed:.2f}  '
+          f'wz +-{args.speed:.2f}'
+          + ('  (same as the web joystick)' if args.speed == 1.0 else '  (web joystick = 1.00 / 0.30 / 1.00)'),
+          flush=True)
     try:
         while not stopped.is_set() and (args.seconds <= 0 or time.monotonic()-started < args.seconds):
             tick = time.monotonic()
