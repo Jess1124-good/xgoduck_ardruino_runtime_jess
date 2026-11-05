@@ -104,10 +104,19 @@ static bool initImu() {
 static bool updateImu() {
   if (qmiAddr == 0) {
     static uint32_t lastProbeMs = 0;
+    static uint32_t probeIntervalMs = 1000u;
     const uint32_t now = millis();
-    if ((uint32_t)(now - lastProbeMs) >= 1000u) {
+    if ((uint32_t)(now - lastProbeMs) >= probeIntervalMs) {
       lastProbeMs = now;
-      initImu();
+      // initImu() blocks for hundreds of ms when the I2C bus is hung, and it
+      // runs inside the 100 Hz control loop. Retrying every second starved the
+      // servo bus (the loop fell to 1.8 Hz), so back off to one attempt a
+      // minute instead of hammering a dead sensor.
+      if (initImu()) {
+        probeIntervalMs = 1000u;
+      } else {
+        probeIntervalMs = probeIntervalMs < 60000u ? probeIntervalMs * 2u : 60000u;
+      }
     }
     return false;
   }
