@@ -3,5 +3,13 @@
 .build/
 __pycache__/
 *.pyc
-data/zero_pos.json
 tests/
+
+# Machine-specific runtime state (servo zero table, gamepad setup snapshots)
+data/*
+!data/.gitkeep
+
+# Superseded experimental walk models - do not commit
+python/xgoduck_walk_v1.onnx
+python/xgoduck_walk_v2.onnx
+python/xgoduck_walk_v3.onnx

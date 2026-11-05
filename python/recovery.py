@@ -3,7 +3,7 @@ import math
 
 
 class Recovery:
-    FALL_DEG, FALL_SECONDS = 55.0, 0.15
+    FALL_DEG, FALL_SECONDS = 40.0, 0.15
     STAND_DEG, STAND_SECONDS = 15.0, 1.0
     HOLD_SECONDS = 1.0
     PERIOD = 1.0 / 50.0

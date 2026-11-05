@@ -4,26 +4,53 @@ for(let i=0;i<4;i++) $('head-controls').insertAdjacentHTML('beforeend',`<label>h
 $('head-controls').insertAdjacentHTML('beforeend','<label>Mouth 34 (°)<input id="mouth" type="range" min="0" max="30" value="0" step="1"></label>');
 async function post(path, body){const r=await fetch('/api/'+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const x=await r.json();if(!r.ok)throw new Error(x.detail||'request failed');return x;}
 function showError(e){$('message').textContent=e.message;}
-async function setMode(mode){try{await post('mode',{mode});$('message').textContent='Mode updated';}catch(e){showError(e);}}
+async function setMode(mode){if(gamepad.enabled)resetMotion();try{await post('mode',{mode});$('message').textContent='Mode updated';}catch(e){showError(e);}}
 document.querySelectorAll('[data-mode]').forEach(b=>b.onclick=()=>setMode(b.dataset.mode));
 $('pick').onclick=async()=>{try{const r=await post('pick',{});$('message').textContent=`Pick started · ${r.model}`;}catch(e){showError(e);}};
 $('roulade').onclick=async()=>{try{const r=await post('roulade',{});$('message').textContent=`Roulade · ${r.model}`;}catch(e){showError(e);}};
 $('stop').onclick=()=>{zero();setMode('off')};
 const keys=new Set(), sticks={left:{x:0,y:0},right:{x:0,y:0}}, resetSticks=[];
-let motion=[0,0,0];
+let motion=[0,0,0], gamepadMotion=[0,0,0], lastMode=null, boardControl=false, boardMotion=[0,0,0];
+const gamepad=new DuckGamepad();
+function pollGamepad(){
+  if(!gamepad.enabled||boardControl)return;
+  try{
+    const sample=gamepad.sample(navigator.getGamepads(),{focused:!document.hidden&&document.hasFocus(),scale:+$('gamepad-speed').value});
+    gamepadMotion=sample.twist;
+    $('gamepad-status').textContent=sample.message;
+    $('gamepad-device').textContent=sample.device||'';
+    if(sample.stop){resetMotion();setMode('off');}
+  }catch(e){
+    gamepad.setEnabled(false);$('gamepad-enable').checked=false;
+    resetMotion();setMode('off');
+    $('gamepad-status').textContent='Gamepad access failed: '+e.message;
+  }
+}
+const gamepadSupported=window.isSecureContext&&typeof navigator.getGamepads==='function';
+$('gamepad-enable').disabled=!gamepadSupported;
+if(!gamepadSupported)$('gamepad-context').textContent=window.isSecureContext
+  ? 'This browser does not provide gamepad access. Open this page in a supported desktop browser.'
+  : 'Gamepad access needs HTTPS or localhost. On your computer run: ssh -N -L 9527:127.0.0.1:9527 arduino@<board-IP>, then open http://localhost:9527.';
+$('gamepad-enable').onchange=()=>{
+  gamepad.setEnabled($('gamepad-enable').checked);zero();
+  if(!gamepad.enabled){$('gamepad-status').textContent='Gamepad disabled';$('gamepad-device').textContent='';}
+};
+$('gamepad-speed').onchange=()=>{if(gamepad.enabled)zero();};
+window.addEventListener('gamepaddisconnected',()=>{pollGamepad();updateMotion();sendCommand();});
 const deadzone=v=>Math.abs(v)<.1?0:v;
 function updateMotion(){
   const key=(a,b)=>keys.has(a)-keys.has(b);
-  motion=[keys.has('w')||keys.has('s')?key('w','s')*.2:deadzone(sticks.left.y)*.4,
+  motion=boardControl?[...boardMotion]:gamepad.enabled?[...gamepadMotion]:[keys.has('w')||keys.has('s')?key('w','s')*.2:deadzone(sticks.left.y)*.4,
     keys.has('a')||keys.has('d')?key('a','d')*.15:deadzone(-sticks.left.x)*.3,
     keys.has('q')||keys.has('e')?key('q','e')*.5:deadzone(-sticks.right.x)];
   ['vx','vy','wz'].forEach((id,i)=>$(id+'Value').textContent=motion[i].toFixed(2));
 }
 async function sendCommand(){
+  pollGamepad();updateMotion();
   if(commandBusy){commandPending=true;return;}
   commandBusy=true;commandPending=false;
   try{await post('command',{twist:[...motion],head:[0,1,2,3].map(i=>+$('head'+i).value),mouth:+$('mouth').value});}
-  catch(e){showError(e);}
+  catch(e){if(gamepad.enabled)resetMotion();showError(e);}
   finally{commandBusy=false;if(commandPending)sendCommand();}
 }
 function joystick(id,side){
@@ -49,19 +76,27 @@ function joystick(id,side){
   zone.onpointerup=zone.onpointercancel=zone.onlostpointercapture=release;
 }
 joystick('joy-left','left');joystick('joy-right','right');
-function zero(){keys.clear();resetSticks.forEach(reset=>reset());updateMotion();sendCommand();}
-$('zero').onclick=zero;
+function resetMotion(){keys.clear();resetSticks.forEach(reset=>reset());gamepad.resetGate();gamepadMotion=[0,0,0];updateMotion();}
+function zero(){resetMotion();sendCommand();}
+$('zero').onclick=()=>{if(boardControl)setMode('off');else zero();};
 ['leg-alpha','head-alpha'].forEach(id=>$(id).onchange=()=>post('filter',{leg:+$('leg-alpha').value,head:+$('head-alpha').value}).catch(showError));
 function keyCommand(){updateMotion();sendCommand();}
 window.addEventListener('keydown',e=>{if(e.code==='Space'){e.preventDefault();$('stop').click();return;}const k=e.key.toLowerCase();if('wasdqe'.includes(k)&&k.length===1){keys.add(k);keyCommand();}});
 window.addEventListener('keyup',e=>{const k=e.key.toLowerCase();if(keys.delete(k))keyCommand();});
-window.addEventListener('blur',()=>{keys.clear();zero();});
-document.addEventListener('visibilitychange',()=>{if(document.hidden){keys.clear();zero();post('mode',{mode:'off'}).catch(()=>{});}});
-window.addEventListener('pagehide',()=>navigator.sendBeacon('/api/mode',new Blob([JSON.stringify({mode:'off'})],{type:'application/json'})));
+window.addEventListener('blur',()=>{zero();if(gamepad.enabled&&!boardControl)setMode('off');});
+document.addEventListener('visibilitychange',()=>{if(document.hidden){keys.clear();zero();post('mode',{mode:'off',page_exit:true}).catch(()=>{});}});
+window.addEventListener('pagehide',()=>navigator.sendBeacon('/api/mode',new Blob([JSON.stringify({mode:'off',page_exit:true})],{type:'application/json'})));
 setInterval(()=>{if(!document.hidden&&!commandBusy)sendCommand();},50);
 setInterval(async()=>{if(statusBusy||document.hidden)return;statusBusy=true;try{const r=await fetch('/api/status');if(!r.ok)throw new Error('status read failed');const s=await r.json();const modeLabel={shadow:'inference only',off:'torque off',hold:'default pose',policy:'walk',calibrate:'calibrate',servo_debug:'servo setup'};$('rx').textContent=s.feedback_hz.toFixed(1)+' Hz';$('rl').textContent=s.inference_hz.toFixed(1)+' Hz';$('servos').textContent=(s.servo_ids?.length||0)+'/15';$('imu').textContent=s.imu_ok?'online':'offline';$('mode').textContent=(modeLabel[s.mode]||s.mode)+(s.enabled?' · enabled':' · torque off');$('message').textContent=s.last_error||`Bridge ${(s.bridge_baud/1e6).toFixed(0)} Mbps · state age ${(s.feedback_age_ms||0).toFixed(1)} ms`;
 document.querySelectorAll('[data-mode="hold"],[data-mode="policy"]').forEach(b=>b.disabled=!s.control_ready);
 const recovery=s.recovery, pick=s.pick, roulade=s.roulade;
+const boardActive=s.input_source==='board_gamepad';
+if(boardActive!==boardControl){boardControl=boardActive;resetMotion();}
+boardMotion=boardControl&&Array.isArray(s.command)?s.command:[0,0,0];
+$('board-gamepad-status').textContent=boardControl?`Board Bluetooth: ${s.board_gamepad?.device||'controller'} · active · LB: move · B: torque off`:s.startup_pose?.active?'Startup default pose is holding · A: walk · B: torque off':s.startup_pose?.pending?'Startup: waiting for all servos, IMU and calibration to be ready':'Board Bluetooth: center sticks, release LB and press A to start.';
+$('gamepad-enable').disabled=!gamepadSupported||boardControl;
+updateMotion();
+if(s.mode!==lastMode){if(gamepad.enabled)resetMotion();lastMode=s.mode;}
 const upright=(s.mode==='shadow'||s.mode==='policy')&&recovery&&recovery.active&&recovery.phase==='walk';
 $('pick').disabled=!upright||(pick&&pick.active)||(roulade&&roulade.active);
 $('roulade').disabled=$('pick').disabled;

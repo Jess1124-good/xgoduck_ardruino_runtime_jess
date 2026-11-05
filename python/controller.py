@@ -4,6 +4,7 @@ import json
 import math
 import threading
 import time
+import uuid
 from pathlib import Path
 from policy import Policy
 from recovery import Recovery
@@ -23,6 +24,8 @@ PICK_MOUTH_CLOSE_PHI = 0.4
 ROULADE_S = 1.9
 ROULADE_ALPHA = 0.15
 CONTROL_PERIOD = 0.02
+GAMEPAD_TIMEOUT = 0.3
+STARTUP_POSE_SETTLE_S = 0.5
 
 class Controller:
     def __init__(self, bridge):
@@ -61,9 +64,16 @@ class Controller:
         self.feedback = self.filtered = None
         self.rx_time = 0.0
         self.mode = 'shadow'
+        self.startup_pose_pending = True
+        self.startup_pose_active = False
+        self.startup_pose_ready_since = None
         self.generation = 0
         self.twist, self.head, self.mouth = [0.0]*3, [0.0]*4, 0.0
         self.web_time = 0.0
+        self.gamepad_session = None
+        self.gamepad_time = 0.0
+        self.gamepad_seq = -1
+        self.gamepad_device = ''
         self.arm_pending = False
         self.seq = self.received = self.inferred = self.sent = self.bad_frames = self.gaps = 0
         self.last_error = ''
@@ -85,6 +95,7 @@ class Controller:
         self.servo_reply_event = threading.Event()
         self.servo_expected_reply = None
         self._zeros_pushed = False
+        self._zeros_confirmed = False
         self._load_zeros()
 
     def _load_zeros(self):
@@ -127,8 +138,11 @@ class Controller:
                 self._push_zeros()
             self.raw_pos = pkt['pos']
             self.raw_mask = pkt['mask']
-            # After a push settles, trust MCU zeros; until then keep file values.
-            if self._zeros_pushed:
+            # The packet that triggered the push predates its application on MCU.
+            # Keep the saved values until a later echo confirms the same zeros.
+            if pkt['zero'] == self.zero_pos:
+                self._zeros_confirmed = True
+            if self._zeros_confirmed:
                 self.zero_pos = pkt['zero']
 
     def receive_servo_reply(self, raw):
@@ -155,11 +169,16 @@ class Controller:
                 step = elapsed_us(fb.seq, old.seq)
                 if step == 0: return
                 if step > 0x80000000:
+                    self.startup_pose_pending = self.startup_pose_active = False
+                    self.startup_pose_ready_since = None
+                    self.gamepad_session = None
+                    self.twist = [0.0]*3
                     self.mode = 'shadow'; self.generation += 1
                     self.arm_pending = False; self.filter.reset()
                     self.recovery.reset(); self.policy_needs_reset = True
                     self._stop_pick_locked(); self._stop_roulade_locked()
                     self._zeros_pushed = False
+                    self._zeros_confirmed = False
                 else:
                     self.gaps += step-1
                 self.rx_intervals.append((now-self.rx_time)*1000)
@@ -182,17 +201,29 @@ class Controller:
         sample = self.feedback.sample_us if self.feedback else 0
         self.bridge.notify('duck_command', encode_command(self.seq, sample, DISARM, DEFAULT_DEG))
 
-    def set_mode(self, mode):
+    def set_mode(self, mode, page_exit=False):
         if mode not in ('shadow', 'off', 'hold', 'policy', 'calibrate', 'servo_debug'):
             raise ValueError('unknown mode')
         with self.lock:
-            if mode == self.mode:
-                self.web_time = time.monotonic()
+            if page_exit and (self.gamepad_session is not None or self.startup_pose_active
+                              or self.startup_pose_pending):
                 return {'mode': self.mode}
             if mode in ('hold', 'policy') and self.mode in EXCLUSIVE_MODES:
                 raise ValueError('exit calibrate/servo_debug first')
             if mode in EXCLUSIVE_MODES and self.mode in ('hold', 'policy'):
                 raise ValueError('disarm before calibrate/servo_debug')
+            # Startup hold is one-shot. An explicit command cancels automatic
+            # enabling, so a stop or sensor failure cannot be undone later.
+            self.startup_pose_pending = self.startup_pose_active = False
+            self.startup_pose_ready_since = None
+            # A deliberate page mode change takes control back from the gamepad,
+            # including selecting the mode that is already active.
+            if self.gamepad_session is not None:
+                self.gamepad_session = None
+                self.twist, self.head, self.mouth = [0.0]*3, [0.0]*4, 0.0
+            if mode == self.mode:
+                self.web_time = time.monotonic()
+                return {'mode': self.mode}
             fb = None
             if mode in ('hold', 'policy'):
                 fb = self._require_feedback(0)
@@ -311,11 +342,77 @@ class Controller:
         with self.lock:
             if self.mode in EXCLUSIVE_MODES:
                 raise ValueError('motion commands disabled in calibrate/servo_debug')
+            if self.startup_pose_active:
+                return {'ok': True, 'ignored': True, 'source': 'startup_pose'}
+            if self.gamepad_session is not None:
+                return {'ok': True, 'ignored': True, 'source': 'board_gamepad'}
             if t is not None and not self.pick_active: self.twist = t
             if h is not None and not self.pick_active: self.head = h
             if m is not None and not self.pick_active: self.mouth = m
             self.web_time = time.monotonic()
         return {'ok': True}
+
+    def _stop_gamepad_locked(self, reason):
+        self.set_mode('off')
+        self.twist = [0.0]*3
+        self._disarm_now()
+        self.last_error = reason
+
+    def gamepad(self, action, session=None, seq=0, twist=None, device='', sent_at=None):
+        """Host joystick transport; sessions prevent stale clients taking over.
+
+        The host and this App run on the same board and share CLOCK_MONOTONIC.
+        Starting requires a separate fresh request; updates never enable torque.
+        """
+        if action not in ('start', 'update', 'release', 'stop'):
+            raise ValueError('unknown gamepad action')
+        if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
+            raise ValueError('invalid gamepad sequence')
+        if sent_at is None or not math.isfinite(float(sent_at)):
+            raise ValueError('gamepad timestamp required')
+        t = [float(v) for v in (twist if twist is not None else [0.0]*3)]
+        if len(t) != 3 or any(not math.isfinite(v) or abs(v) > limit
+                             for v, limit in zip(t, (.4, .3, 1.0))):
+            raise ValueError('invalid gamepad twist')
+        if not isinstance(device, str) or len(device) > 128:
+            raise ValueError('invalid gamepad device')
+        with self.lock:
+            now = time.monotonic()
+            age = now - float(sent_at)
+            if age < -0.05 or age > GAMEPAD_TIMEOUT:
+                raise ValueError('stale gamepad request')
+            if action == 'stop':
+                # B also stops the automatic pose before A has created a session.
+                self._stop_gamepad_locked('board gamepad B; disarmed')
+                return {'ok': True}
+            if self.gamepad_session is not None and now-self.gamepad_time > GAMEPAD_TIMEOUT:
+                self._stop_gamepad_locked('board gamepad heartbeat lost; disarmed')
+            if action == 'start':
+                if session is not None or any(t):
+                    raise ValueError('start requires centered sticks and no existing session')
+                if self.gamepad_session is not None:
+                    raise ValueError('another gamepad session is active')
+                self._require_feedback(0)
+                self.set_mode('policy')
+                self.twist, self.head, self.mouth = [0.0]*3, [0.0]*4, 0.0
+                self.gamepad_session = uuid.uuid4().hex
+                self.gamepad_seq = seq
+                self.gamepad_time, self.gamepad_device = now, device
+                return {'ok': True, 'session': self.gamepad_session}
+            if session is None or session != self.gamepad_session:
+                raise ValueError('gamepad session ended; release controls and press A again')
+            if seq <= self.gamepad_seq:
+                raise ValueError('out-of-order gamepad command')
+            if action == 'release':
+                self._stop_gamepad_locked('board gamepad released; disarmed')
+                return {'ok': True}
+            if self.mode != 'policy':
+                self._stop_gamepad_locked('board gamepad mode changed; disarmed')
+                raise ValueError('gamepad no longer controls walking')
+            self.gamepad_seq, self.gamepad_time = seq, now
+            if not self.pick_active:
+                self.twist = t
+            return {'ok': True}
 
     def cal_targets_set(self, targets):
         values = [int(v) for v in targets]
@@ -423,17 +520,45 @@ class Controller:
             raise ValueError('servo operation failed')
         return reply
 
+    def _startup_pose_locked(self, now):
+        if not self.startup_pose_pending:
+            return
+        fb, filt = self.feedback, self.filtered
+        ready = (self.mode == 'shadow' and fb and now-self.rx_time < .15
+                 and fb.imu_ok and fb.mask == ALL_MASK
+                 and not fb.calibrating and not fb.servo_debugging
+                 and filt and filt['imu_fusion_ready'] and filt['imu_fusion_updated']
+                 and self._zeros_confirmed)
+        if not ready:
+            self.startup_pose_ready_since = None
+            return
+        if self.startup_pose_ready_since is None:
+            self.startup_pose_ready_since = now
+        if now-self.startup_pose_ready_since >= STARTUP_POSE_SETTLE_S:
+            self.set_mode('hold')
+            self.startup_pose_active = True
+            print('Startup: default pose enabled; press A to walk, B for torque off', flush=True)
+
     def step(self):
         with self.lock:
+            self._startup_pose_locked(time.monotonic())
+            if self.gamepad_session is not None and time.monotonic()-self.gamepad_time > GAMEPAD_TIMEOUT:
+                self._stop_gamepad_locked('board gamepad heartbeat lost; disarmed')
             fb, filt, generation, mode = self.feedback, self.filtered, self.generation, self.mode
             age = time.monotonic()-self.rx_time
             if mode in ('hold','policy'):
                 lost = None
                 if not fb or age>.15 or not fb.imu_ok:
                     lost = 'sensor feedback lost; disarmed'
-                elif time.monotonic()-self.web_time > 1.0:
+                elif self.startup_pose_active and fb.mask != ALL_MASK:
+                    lost = 'startup pose servo feedback lost; disarmed'
+                elif not self.startup_pose_active and self.gamepad_session is None and time.monotonic()-self.web_time > 1.0:
                     lost = 'web heartbeat lost; disarmed'
                 if lost:
+                    self.startup_pose_pending = self.startup_pose_active = False
+                    self.startup_pose_ready_since = None
+                    self.gamepad_session = None
+                    self.twist = [0.0]*3
                     self.mode = mode = 'shadow'; self.generation += 1
                     self.arm_pending = False; self.last_error = lost
                     generation = self.generation
@@ -572,6 +697,9 @@ class Controller:
                 self.step()
             except Exception as exc:
                 with self.lock:
+                    self.startup_pose_pending = self.startup_pose_active = False
+                    self.gamepad_session = None
+                    self.twist = [0.0]*3
                     self.last_error = str(exc); self.mode = 'off'; self.generation += 1; self.arm_pending = False
                     self._stop_pick_locked(); self._stop_roulade_locked()
             deadline += CONTROL_PERIOD
@@ -591,6 +719,9 @@ class Controller:
     def stop(self):
         self.stop_event.set()
         with self.lock:
+            self.startup_pose_pending = self.startup_pose_active = False
+            self.gamepad_session = None
+            self.twist = [0.0]*3
             previous = self.mode
             self.mode = 'off'; self.generation += 1; self.arm_pending = False
             if previous == 'calibrate':
@@ -628,6 +759,16 @@ class Controller:
                 cal_targets=list(self.cal_targets), raw_mask=self.raw_mask)
             result['control_ready']=bool(fb and fb.imu_ok and now-self.rx_time<.15 and self.mode not in EXCLUSIVE_MODES)
             result['servo_scan_version'] = 1
+            result['board_gamepad_protocol'] = 1
+            result['input_source'] = ('board_gamepad' if self.gamepad_session is not None
+                                      else 'startup_pose' if self.startup_pose_active else 'web')
+            result['startup_pose'] = dict(pending=self.startup_pose_pending,
+                active=self.startup_pose_active, settle_s=STARTUP_POSE_SETTLE_S,
+                zeros_confirmed=self._zeros_confirmed)
+            result['board_gamepad'] = dict(active=self.gamepad_session is not None,
+                device=self.gamepad_device,
+                age_ms=(now-self.gamepad_time)*1000 if self.gamepad_time else None,
+                timeout_ms=GAMEPAD_TIMEOUT*1000)
             result['deployment'] = dict(reference='rl/raspi_deploy', control_hz=50,
                 home_deg=HOME_DEG.tolist(), default_deg=DEFAULT_DEG,
                 action_scale=self.policy.action_scale, action_alpha=self.policy.action_alpha,

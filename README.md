@@ -101,7 +101,7 @@ GCC 14 can tail-call `k_thread_name_set` at the end of `setup()` with a Thumb `J
 
 The web UI is served on port 9527. App Lab starts the same app under the name in `app.yaml`.
 
-The app boots in **inference only**: the network runs, torque stays off. From the control page:
+The app waits for fresh feedback from all 15 servos and the IMU, plus an echo of the saved calibration zeros, then requires 0.5 s of stable readiness before automatically enabling **Default pose**. The first enable uses measured angles; following targets hold the existing default pose. This startup hold stays active without a browser or controller. Press A on the board's gamepad to switch to walk; B or the page's Torque off disables torque, including before A was pressed. An explicit mode change, sensor loss or MCU reset cancels automatic enabling for the rest of this App run. From the control page:
 
 | Control | Effect |
 | --- | --- |
@@ -112,9 +112,25 @@ The app boots in **inference only**: the network runs, torque stays off. From th
 | Roulade | While upright in walk, runs `xgoduck_roulade.onnx` for 1.9 s, then returns to walk. |
 | Torque off | Disables position control. |
 
-Closing the page, or leaving it in the background for more than 1 second, turns position control off. Calibration and servo setup use a 2 second heartbeat and then exit and turn torque off.
+Startup Default pose holds independently of web/gamepad heartbeats. While the web page owns motion, closing it or leaving it in the background for more than 1 second turns position control off. Direct board gamepad control uses its own 300 ms heartbeat and continues when the updated page closes. Calibration and servo setup use a 2 second heartbeat and then exit and turn torque off.
 
 Walk commands are vx ±0.4, vy ±0.3, ωz ±1.0, with a joystick dead zone of 0.1. Head channels are four radians in ±1. Keyboard: W/S, A/D, Q/E, Space.
+
+## Xbox / GameSir gamepad
+
+For a GameSir Nova Lite paired directly to the UNO Q over Bluetooth, see [板载蓝牙手柄直接控制](docs/board-gamepad-zh.md). The host reader is `tools/board-gamepad.py`; default mode previews input only. `--run` uses the new `/api/gamepad` interface with its own heartbeat and input ownership. The browser integration below reads controllers connected to the browser's computer.
+
+Connect a controller to the **computer running the browser**, using its PC / XInput mode. Open the control page through HTTPS or localhost, enable **Use gamepad**, release LB and center both sticks. Hold LB to move: left stick controls forward/back and strafe; right stick controls yaw. Releasing LB zeros velocity; B requests torque off. Walking is enabled explicitly with **Walk / get up** on the page. Default speed is 50%; the stick dead zone is 0.12. While enabled, gamepad input takes priority over the keyboard and screen pads.
+
+Browser gamepad access may be unavailable at `http://<board-IP>:9527`. If SSH is enabled and the app is running, run this on the computer, replacing `<board-IP>`, and keep the terminal open:
+
+```bash
+ssh -N -L 9527:127.0.0.1:9527 arduino@<board-IP>
+```
+
+Then visit `http://localhost:9527`. A nonstandard controller layout is rejected with a mode hint. Disconnecting the selected controller or losing page focus requests torque off; reconnecting requires LB release and centered sticks. Changing mode, zeroing motion or changing speed also requires that neutral cycle. Existing host/MCU watchdogs handle lost network requests.
+
+This integration uses the browser's standard Gamepad API, not a direct Linux controller driver. The controller must be connected to the browser's computer. See [中文框架与手柄接入说明](docs/gamepad-zh.md) for the architecture, mapping, direct-to-board requirements and verification limits. Offline checks: `node tools/test-gamepad.js`.
 
 ## Policies
 

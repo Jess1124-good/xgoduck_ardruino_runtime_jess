@@ -15,11 +15,15 @@ Bridge.provide('duck_raw', controller.receive_raw)
 Bridge.provide('duck_servo_reply', controller.receive_servo_reply)
 
 def mode(body: dict):
-    try: return controller.set_mode(body['mode'])
+    try: return controller.set_mode(body['mode'], page_exit=body.get('page_exit', False))
     except (KeyError, ValueError) as exc: raise HTTPException(400, str(exc))
 
 def command(body: dict):
     try: return controller.command(**body)
+    except (TypeError, ValueError) as exc: raise HTTPException(400, str(exc))
+
+def gamepad(body: dict):
+    try: return controller.gamepad(**body)
     except (TypeError, ValueError) as exc: raise HTTPException(400, str(exc))
 
 def filtering(body: dict):
@@ -72,6 +76,7 @@ def servo_action(body: dict):
 ui.expose_api('GET', '/api/status', controller.status)
 ui.expose_api('POST', '/api/mode', mode)
 ui.expose_api('POST', '/api/command', command)
+ui.expose_api('POST', '/api/gamepad', gamepad)
 ui.expose_api('POST', '/api/filter', filtering)
 ui.expose_api('POST', '/api/pick', pick)
 ui.expose_api('POST', '/api/roulade', roulade)

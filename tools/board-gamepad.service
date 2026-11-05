@@ -1,0 +1,20 @@
+[Unit]
+Description=XGO Duck paired Bluetooth joystick input
+After=bluetooth.service network.target
+Wants=bluetooth.service
+
+[Service]
+Type=simple
+User=arduino
+SupplementaryGroups=input
+WorkingDirectory=/home/arduino/ArduinoApps/xgoduck_runtime_arduino-master
+ExecStart=/usr/bin/python3 -u tools/board-gamepad.py --mac 47:84:65:FD:BE:E7 --run --reconnect
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/tmp
+
+[Install]
+WantedBy=multi-user.target
