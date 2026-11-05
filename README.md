@@ -136,18 +136,39 @@ This integration uses the browser's standard Gamepad API, not a direct Linux con
 
 Models in `python/`:
 
-- `xgoduck_walk.onnx`
+- `xgoduck_walk.onnx` — **main** walk slot (required)
+- `xgoduck_walk_test.onnx` — **test** walk slot (optional, loaded on first switch)
 - `xgoduck_getup.onnx`
 - `xgoduck_pick.onnx`
 - `xgoduck_roulade.onnx`
 
-Each expects observation `[1, 61]` and emits action `[1, 14]`. All four are loaded and warmed at startup. Spare time in the 50 Hz loop runs one dummy pass on an idle session so a switch does not pay a cold start.
+Each expects observation `[1, 61]` and emits action `[1, 14]`. All are loaded and warmed at startup except the test slot. Spare time in the 50 Hz loop runs one dummy pass on an idle session so a switch does not pay a cold start.
+
+### Walk model slots
+
+Two walking policies can live on the robot and be swapped without restarting the app:
+
+| Slot | File | Notes |
+| --- | --- | --- |
+| `main` | `python/xgoduck_walk.onnx` | Required. Loaded and warmed at startup. |
+| `test` | `python/xgoduck_walk_test.onnx` | Optional. Loaded and warmed the first time you switch to it; a missing file is reported as an error, not a crash. |
+
+Switch with the **Walk slot** selector on the Control page, or over HTTP:
+
+```bash
+curl -X POST http://<board>:9527/api/walk_model \
+  -H 'Content-Type: application/json' -d '{"slot":"test"}'
+```
+
+The switch is refused while walk mode is engaged (`mode == "policy"`) so a model is never swapped mid-stride. On acceptance the action filter is reset, the newly selected session is warmed, and any action already computed for the current cycle is dropped. The choice lives in RAM only: a restart always comes back on `main`.
+
+`GET /api/status` exposes `walk_model` with `slot`, `active`, `main`, `test`, `test_loaded`, `test_available`, and `slots`.
 
 Observation layout: gyro (rad/s), gravity, 14 joint positions relative to home, 14 joint velocities, previous action, twist (3), head (4), and six zeros.
 
 Recovery, evaluated on the 50 Hz clock:
 
-- Tilt above 55° for 0.15 s → get-up model, action forced to 0 for 1 s, then the get-up action. Twist and head are zero.
+- Tilt above 40° for 0.15 s → get-up model, action forced to 0 for 1 s, then the get-up action. Twist and head are zero.
 - Tilt below 15° for 1 s → walk, and the web twist/head/mouth commands apply again.
 - Pick, only from upright walk: command `[cos(2πφ), sin(2πφ), 0]` plus ten zeros, `φ` advances by `dt/4` (a 4 s cycle). The mouth opens to 30° and closes when φ ≥ 0.4.
 - Roulade, only from upright walk: runs for 1.9 s with twist, head, and the six trailing command inputs at 0. Gyro, gravity, joint position, joint velocity, and the previous action stay on the usual path. Leg and neck smoothing drop to α = 0.15 for that window, then return to the previous values. Tilt does not select get-up until the 1.9 s ends.

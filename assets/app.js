@@ -8,6 +8,8 @@ async function setMode(mode){if(gamepad.enabled)resetMotion();try{await post('mo
 document.querySelectorAll('[data-mode]').forEach(b=>b.onclick=()=>setMode(b.dataset.mode));
 $('pick').onclick=async()=>{try{const r=await post('pick',{});$('message').textContent=`Pick started · ${r.model}`;}catch(e){showError(e);}};
 $('roulade').onclick=async()=>{try{const r=await post('roulade',{});$('message').textContent=`Roulade · ${r.model}`;}catch(e){showError(e);}};
+$('walk-slot').onchange=async()=>{const want=$('walk-slot').value;try{const r=await post('walk_model',{slot:want});$('message').textContent=`Walk slot ${r.slot} · ${r.model}`;}catch(e){showError(e);$('walk-slot').value='main';}};
+fetch('/api/status').then(r=>r.json()).then(s=>{if(s.walk_model)$('walk-slot').value=s.walk_model.slot;}).catch(()=>{});
 $('stop').onclick=()=>{zero();setMode('off')};
 const keys=new Set(), sticks={left:{x:0,y:0},right:{x:0,y:0}}, resetSticks=[];
 let motion=[0,0,0], gamepadMotion=[0,0,0], lastMode=null, boardControl=false, boardMotion=[0,0,0];

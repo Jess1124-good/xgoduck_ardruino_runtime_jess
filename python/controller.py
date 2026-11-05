@@ -26,6 +26,13 @@ ROULADE_ALPHA = 0.15
 CONTROL_PERIOD = 0.02
 GAMEPAD_TIMEOUT = 0.3
 STARTUP_POSE_SETTLE_S = 0.5
+# Two walk-model slots. "main" is the policy the robot actually runs; "test" is a
+# candidate under evaluation. Both files live in python/. The test file is
+# optional: its slot loads on first switch and reports a clear error if missing,
+# so a checkout without it still boots.
+WALK_MAIN_ONNX = 'xgoduck_walk.onnx'
+WALK_TEST_ONNX = 'xgoduck_walk_test.onnx'
+WALK_SLOTS = ('main', 'test')
 
 class Controller:
     def __init__(self, bridge):
@@ -53,6 +60,10 @@ class Controller:
         if not ok:
             raise RuntimeError(message)
         self.model_message += '; ' + message
+        # Walk slots: main is required, test is loaded on demand.
+        self.main_policy = self.policy
+        self.test_policy = None
+        self.walk_slot = 'main'
         self.recovery = Recovery()
         self.policy_needs_reset = True
         self.pick_active = False
@@ -258,7 +269,10 @@ class Controller:
         return {'mode': mode}
 
     def _models(self):
-        return (self.policy, self.getup_policy, self.pick_policy, self.roulade_policy)
+        models = [self.main_policy, self.getup_policy, self.pick_policy, self.roulade_policy]
+        if self.test_policy is not None:
+            models.append(self.test_policy)
+        return tuple(models)
 
     def _apply_alphas_locked(self, leg, head):
         for model in self._models():
@@ -274,6 +288,44 @@ class Controller:
                 else:
                     self._apply_alphas_locked(leg, head)
                 return leg, head
+
+    def set_walk_slot(self, slot):
+        """Switch the walking policy between the 'main' and 'test' slots.
+
+        The switch is refused while walk mode is engaged: swapping the model
+        mid-stride would hand the robot an action from a different policy.
+        """
+        slot = str(slot).strip().lower()
+        if slot not in WALK_SLOTS:
+            raise ValueError("walk slot must be 'main' or 'test'")
+        with self.lock:
+            if self.mode == 'policy':
+                raise ValueError('stop walking before switching the walk model')
+            if slot == 'test' and self.test_policy is None:
+                candidate = Policy()
+                ok, message = candidate.load(WALK_TEST_ONNX)
+                if not ok:
+                    raise ValueError(f'test model unavailable: {message}')
+                candidate.set_action_alphas(leg=self.main_policy.action_alpha,
+                                            head=self.main_policy.action_alpha_head)
+                self.test_policy = candidate
+                self.model_message += '; ' + message
+            selected = self.main_policy if slot == 'main' else self.test_policy
+            with self.policy_lock:
+                if selected is not self.policy:
+                    selected.reset_action_filter()
+                    selected.warm(1)
+                self.policy = selected
+                self.walk_slot = slot
+            # Drop any action the previous model already computed this cycle.
+            self.generation += 1
+            self.policy_needs_reset = True
+            self.twist = [0.0] * 3
+            self.last_error = ''
+            self.web_time = time.monotonic()
+            return dict(slot=self.walk_slot, model=self.policy.file,
+                        action_alpha=self.policy.action_alpha,
+                        action_alpha_head=self.policy.action_alpha_head)
 
     def _stop_pick_locked(self):
         self.pick_active = False
@@ -679,7 +731,7 @@ class Controller:
                 active = self.policy
             else:
                 active = self.getup_policy
-            candidates = [p for p in (self.policy, self.getup_policy, self.pick_policy, self.roulade_policy) if p is not active]
+            candidates = [p for p in self._models() if p is not active]
         if not candidates:
             return
         self._warm_index = (self._warm_index + 1) % len(candidates)
@@ -758,6 +810,15 @@ class Controller:
                 factory_zero_pos=list(FACTORY_ZERO), cal_done=list(self.cal_done),
                 cal_targets=list(self.cal_targets), raw_mask=self.raw_mask)
             result['control_ready']=bool(fb and fb.imu_ok and now-self.rx_time<.15 and self.mode not in EXCLUSIVE_MODES)
+            result['walk_model'] = dict(
+                slot=self.walk_slot,
+                active=self.policy.file,
+                main=self.main_policy.file,
+                test=self.test_policy.file if self.test_policy is not None else WALK_TEST_ONNX,
+                test_loaded=self.test_policy is not None,
+                test_available=(self.test_policy is not None
+                                or (Path(__file__).resolve().parent / WALK_TEST_ONNX).is_file()),
+                slots=list(WALK_SLOTS))
             result['servo_scan_version'] = 1
             result['board_gamepad_protocol'] = 1
             result['input_source'] = ('board_gamepad' if self.gamepad_session is not None

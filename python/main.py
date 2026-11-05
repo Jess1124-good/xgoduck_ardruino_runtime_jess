@@ -26,6 +26,10 @@ def gamepad(body: dict):
     try: return controller.gamepad(**body)
     except (TypeError, ValueError) as exc: raise HTTPException(400, str(exc))
 
+def walk_model(body: dict):
+    try: return controller.set_walk_slot(body['slot'])
+    except (KeyError, TypeError, ValueError) as exc: raise HTTPException(400, str(exc))
+
 def filtering(body: dict):
     try:
         leg, head = controller.set_action_alphas(**body)
@@ -77,6 +81,7 @@ ui.expose_api('GET', '/api/status', controller.status)
 ui.expose_api('POST', '/api/mode', mode)
 ui.expose_api('POST', '/api/command', command)
 ui.expose_api('POST', '/api/gamepad', gamepad)
+ui.expose_api('POST', '/api/walk_model', walk_model)
 ui.expose_api('POST', '/api/filter', filtering)
 ui.expose_api('POST', '/api/pick', pick)
 ui.expose_api('POST', '/api/roulade', roulade)
