@@ -101,7 +101,7 @@ GCC 14 can tail-call `k_thread_name_set` at the end of `setup()` with a Thumb `J
 
 The web UI is served on port 9527. App Lab starts the same app under the name in `app.yaml`.
 
-The app waits for fresh feedback from all 15 servos and the IMU, plus an echo of the saved calibration zeros, then requires 0.5 s of stable readiness before automatically enabling **Default pose**. The first enable uses measured angles; following targets hold the existing default pose. This startup hold stays active without a browser or controller. Press A on the board's gamepad to switch to walk; B or the page's Torque off disables torque, including before A was pressed. An explicit mode change, sensor loss or MCU reset cancels automatic enabling for the rest of this App run. From the control page:
+The app waits for fresh feedback from all 15 servos and the IMU, plus an echo of the saved calibration zeros, then requires 0.5 s of stable readiness — but **it never stands up on its own**. **Default pose** is entered only on an explicit request: press **X** on the board's gamepad, or click **Default pose** on the page. Until then the robot stays in inference only with torque off. The first enable uses measured angles; following targets hold the existing default pose. This requested hold stays active without a browser or controller. Press A on the board's gamepad to switch to walk; B or the page's Torque off disables torque, including before A was pressed. An explicit mode change, sensor loss or MCU reset cancels the pending start for the rest of this App run. From the control page:
 
 | Control | Effect |
 | --- | --- |

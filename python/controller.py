@@ -416,7 +416,7 @@ class Controller:
         The host and this App run on the same board and share CLOCK_MONOTONIC.
         Starting requires a separate fresh request; updates never enable torque.
         """
-        if action not in ('start', 'update', 'release', 'stop'):
+        if action not in ('start', 'update', 'release', 'stop', 'pose'):
             raise ValueError('unknown gamepad action')
         if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
             raise ValueError('invalid gamepad sequence')
@@ -437,6 +437,9 @@ class Controller:
                 # B also stops the automatic pose before A has created a session.
                 self._stop_gamepad_locked('board gamepad B; disarmed')
                 return {'ok': True}
+            if action == 'pose':
+                # X enables the default pose without creating a walk session.
+                return self.enter_startup_pose()
             if self.gamepad_session is not None and now-self.gamepad_time > GAMEPAD_TIMEOUT:
                 self._stop_gamepad_locked('board gamepad heartbeat lost; disarmed')
             if action == 'start':
@@ -572,24 +575,49 @@ class Controller:
             raise ValueError('servo operation failed')
         return reply
 
+    def _startup_pose_inputs_ready(self, now):
+        fb, filt = self.feedback, self.filtered
+        return bool(self.mode == 'shadow' and fb and now-self.rx_time < .15
+                    and fb.imu_ok and fb.mask == ALL_MASK
+                    and not fb.calibrating and not fb.servo_debugging
+                    and filt and filt['imu_fusion_ready'] and filt['imu_fusion_updated']
+                    and self._zeros_confirmed)
+
     def _startup_pose_locked(self, now):
+        """Track whether the robot is safe to stand up. It never moves the motors.
+
+        Torque is only enabled by an explicit request (gamepad X, or Default pose
+        in the page), so a booting board cannot stand itself up unattended.
+        """
         if not self.startup_pose_pending:
             return
-        fb, filt = self.feedback, self.filtered
-        ready = (self.mode == 'shadow' and fb and now-self.rx_time < .15
-                 and fb.imu_ok and fb.mask == ALL_MASK
-                 and not fb.calibrating and not fb.servo_debugging
-                 and filt and filt['imu_fusion_ready'] and filt['imu_fusion_updated']
-                 and self._zeros_confirmed)
-        if not ready:
+        if not self._startup_pose_inputs_ready(now):
             self.startup_pose_ready_since = None
             return
         if self.startup_pose_ready_since is None:
             self.startup_pose_ready_since = now
-        if now-self.startup_pose_ready_since >= STARTUP_POSE_SETTLE_S:
+
+    def startup_pose_ready(self):
+        """True once every servo, the IMU and the saved zero table held for the settle time."""
+        now = time.monotonic()
+        return (self.startup_pose_pending and self._startup_pose_inputs_ready(now)
+                and self.startup_pose_ready_since is not None
+                and now-self.startup_pose_ready_since >= STARTUP_POSE_SETTLE_S)
+
+    def enter_startup_pose(self):
+        """Enable torque into the default pose. Requires an explicit operator request."""
+        with self.lock:
+            if not self.startup_pose_pending:
+                return {'ok': True, 'already': True, 'mode': self.mode}
+            if not self.startup_pose_ready():
+                raise ValueError('default pose not ready: wait for 15 servos, IMU and saved calibration')
+            if self.mode != 'shadow':
+                raise ValueError(f'default pose needs inference-only mode, current is {self.mode}')
             self.set_mode('hold')
+            # set_mode clears both flags; keep the pose alive without a browser.
             self.startup_pose_active = True
-            print('Startup: default pose enabled; press A to walk, B for torque off', flush=True)
+            print('Startup: default pose enabled on request; press A to walk, B for torque off', flush=True)
+            return {'ok': True, 'mode': self.mode}
 
     def step(self):
         with self.lock:
@@ -824,8 +852,8 @@ class Controller:
             result['input_source'] = ('board_gamepad' if self.gamepad_session is not None
                                       else 'startup_pose' if self.startup_pose_active else 'web')
             result['startup_pose'] = dict(pending=self.startup_pose_pending,
-                active=self.startup_pose_active, settle_s=STARTUP_POSE_SETTLE_S,
-                zeros_confirmed=self._zeros_confirmed)
+                ready=self.startup_pose_ready(), active=self.startup_pose_active,
+                settle_s=STARTUP_POSE_SETTLE_S, zeros_confirmed=self._zeros_confirmed)
             result['board_gamepad'] = dict(active=self.gamepad_session is not None,
                 device=self.gamepad_device,
                 age_ms=(now-self.gamepad_time)*1000 if self.gamepad_time else None,

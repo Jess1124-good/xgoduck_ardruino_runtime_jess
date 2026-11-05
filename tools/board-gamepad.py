@@ -22,7 +22,7 @@ import urllib.request
 
 EVENT = struct.Struct('=IhBB')
 ABS_X, ABS_Y, ABS_Z, ABS_RX = 0, 1, 2, 3
-BTN_A, BTN_B, BTN_LB = 0x130, 0x131, 0x136
+BTN_A, BTN_B, BTN_X, BTN_LB = 0x130, 0x131, 0x133, 0x136
 
 
 def ioctl_read(fd, number, size):
@@ -86,6 +86,7 @@ class Joystick:
                        and {BTN_A, BTN_B, BTN_LB} <= self.buttons.keys())
         return dict(axes=[self.axes.get(code, 0.0) for code in (ABS_X, ABS_Y, self.yaw_axis)],
                     a=self.buttons.get(BTN_A, False), b=self.buttons.get(BTN_B, False),
+                    x=self.buttons.get(BTN_X, False),
                     lb=self.buttons.get(BTN_LB, False), initialized=initialized,
                     button_events=button_events)
 
@@ -93,22 +94,27 @@ class Joystick:
 class InputGate:
     def __init__(self, speed=0.5):
         self.speed = speed
-        self.ready = self.a_down = False
+        self.ready = self.a_down = self.x_down = False
 
     def reset(self):
         # Do not retrigger an A button that is still held after a failed request.
         self.ready = False
+        self.x_down = False
 
     def sample(self, state):
         a, b, lb = state['a'], state['b'], state['lb']
+        x = state.get('x', False)
         presses = {event['code'] for event in state.get('button_events', []) if event['pressed']}
         releases = {event['code'] for event in state.get('button_events', []) if not event['pressed']}
         rising = (a and not self.a_down) or BTN_A in presses
+        # X enables the default pose; it is a plain request, not a session.
+        pose = (x and not self.x_down) or BTN_X in presses
         self.a_down = a
+        self.x_down = x
         b = b or BTN_B in presses
         if not state['initialized'] or b or not all(math.isfinite(v) for v in state['axes']):
             self.reset()
-            return dict(start=False, stop=b, twist=[0.0]*3, ready=False)
+            return dict(start=False, stop=b, pose=False, twist=[0.0]*3, ready=False)
         centered = all(abs(v) <= 0.12 for v in state['axes'])
         if not self.ready:
             self.ready = centered and not (a or b or lb)
@@ -116,9 +122,9 @@ class InputGate:
         def axis(value):
             value = max(-1.0, min(1.0, value))
             return 0.0 if abs(value) <= .12 else math.copysign((abs(value)-.12)/.88, value)
-        x, y, yaw = [axis(v) for v in state['axes']]
-        twist = [-y*.4*self.speed, -x*.3*self.speed, -yaw*self.speed] if self.ready and lb and BTN_LB not in releases else [0.0]*3
-        return dict(start=start, stop=False, twist=twist, ready=self.ready)
+        x_axis, y, yaw = [axis(v) for v in state['axes']]
+        twist = [-y*.4*self.speed, -x_axis*.3*self.speed, -yaw*self.speed] if self.ready and lb and BTN_LB not in releases else [0.0]*3
+        return dict(start=start, stop=False, pose=pose, twist=twist, ready=self.ready)
 
 
 class PreviewSummary:
@@ -134,9 +140,9 @@ class PreviewSummary:
             else:
                 for bounds, value in zip(self.axis_ranges, state['axes']):
                     bounds[0], bounds[1] = min(bounds[0], value), max(bounds[1], value)
-        names = {BTN_A: 'A', BTN_B: 'B', BTN_LB: 'LB'}
+        names = {BTN_A: 'A', BTN_B: 'B', BTN_X: 'X', BTN_LB: 'LB'}
         for code, name in names.items():
-            if state[name.lower()]:
+            if state.get(name.lower()):
                 self.buttons.add(name)
         for event in state.get('button_events', []):
             if event['pressed'] and event['code'] in names:
@@ -200,6 +206,10 @@ class Client:
         finally:
             self.session = None
 
+    def pose(self):
+        """X enables the default pose without creating a walk session."""
+        return self.send('pose')
+
 
 def reconnect(mac, stopped, missing):
     """Only reconnect the chosen, already paired and trusted remote device."""
@@ -254,8 +264,9 @@ def main():
     last_print, last_message = 0.0, ''
     stop_latched = False
     summary = PreviewSummary()
-    print('CONTROL: release LB, center sticks, press A to start walking; hold LB to move; B stops torque.'
-          if client else 'PREVIEW ONLY: no API calls or motor commands. Move sticks and press A/B/LB.', flush=True)
+    print('CONTROL: press X for the default pose, then release LB and center sticks and press A to walk; '
+          'hold LB to move; B stops torque.'
+          if client else 'PREVIEW ONLY: no API calls or motor commands. Move sticks and press A/B/X/LB.', flush=True)
     try:
         while not stopped.is_set() and (args.seconds <= 0 or time.monotonic()-started < args.seconds):
             tick = time.monotonic()
@@ -283,6 +294,13 @@ def main():
                     if mapped['stop']:
                         if not stop_latched:
                             client.stop()
+                    elif mapped.get('pose') and not client.session:
+                        try:
+                            reply = client.pose()
+                            print('X: default pose ' + ('already active' if reply.get('already') else 'enabled'),
+                                  flush=True)
+                        except (OSError, ValueError) as exc:
+                            print('X: default pose not started:', exc, flush=True)
                     elif mapped['start'] and not client.session:
                         client.start(stick.name)
                         print('Gamepad controls walking', flush=True)
