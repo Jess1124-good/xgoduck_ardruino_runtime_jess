@@ -24,6 +24,11 @@ EVENT = struct.Struct('=IhBB')
 ABS_X, ABS_Y, ABS_Z, ABS_RX = 0, 1, 2, 3
 BTN_A, BTN_B, BTN_X, BTN_LB = 0x130, 0x131, 0x133, 0x136
 
+# Command peaks before --speed scaling. Forward keeps the training range; the
+# robot falls after a few backward steps at -0.4, so reverse is capped at half.
+VX_FORWARD, VX_BACKWARD = 0.4, 0.2
+VY_PEAK, WZ_PEAK = 0.3, 1.0
+
 
 def ioctl_read(fd, number, size):
     buffer = bytearray(size)
@@ -123,7 +128,12 @@ class InputGate:
             value = max(-1.0, min(1.0, value))
             return 0.0 if abs(value) <= .12 else math.copysign((abs(value)-.12)/.88, value)
         x_axis, y, yaw = [axis(v) for v in state['axes']]
-        twist = [-y*.4*self.speed, -x_axis*.3*self.speed, -yaw*self.speed] if self.ready and lb and BTN_LB not in releases else [0.0]*3
+        # Backward is deliberately half of forward: the policy keeps its balance
+        # margin going forward at +0.4 but falls within a few steps at -0.4.
+        vx = -y * self.speed
+        twist = [vx * (VX_FORWARD if vx >= 0 else VX_BACKWARD),
+                 -x_axis * VY_PEAK * self.speed,
+                 -yaw * WZ_PEAK * self.speed] if self.ready and lb and BTN_LB not in releases else [0.0]*3
         return dict(start=start, stop=False, pose=pose, twist=twist, ready=self.ready)
 
 
@@ -268,8 +278,9 @@ def main():
     print('CONTROL: press X for the default pose, then release LB and center sticks and press A to walk; '
           'hold LB to move; B stops torque.'
           if client else 'PREVIEW ONLY: no API calls or motor commands. Move sticks and press A/B/X/LB.', flush=True)
-    print(f'Peak command at --speed {args.speed}: vx +-{0.4*args.speed:.2f}  vy +-{0.3*args.speed:.2f}  '
-          f'wz +-{args.speed:.2f}'
+    print(f'Peak command at --speed {args.speed}: vx +-{VX_FORWARD*args.speed:.2f} '
+          f'(reverse -{VX_BACKWARD*args.speed:.2f})  vy +-{VY_PEAK*args.speed:.2f}  '
+          f'wz +-{WZ_PEAK*args.speed:.2f}'
           + ('  (same as the web joystick)' if args.speed == 1.0 else '  (web joystick = 1.00 / 0.30 / 1.00)'),
           flush=True)
     try:
