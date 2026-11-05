@@ -24,6 +24,8 @@ PICK_MOUTH_CLOSE_PHI = 0.4
 ROULADE_S = 1.9
 ROULADE_ALPHA = 0.15
 CONTROL_PERIOD = 0.02
+# Consecutive all-zero IMU frames before the signal is declared dead (100 Hz).
+IMU_ZERO_LIMIT = 5
 GAMEPAD_TIMEOUT = 0.3
 STARTUP_POSE_SETTLE_S = 0.5
 # Two walk-model slots. "main" is the policy the robot actually runs; "test" is a
@@ -91,6 +93,8 @@ class Controller:
         # Short history of disarms/errors with uptime, so a later message does
         # not hide what actually dropped torque (a B press used to erase it).
         self.event_log = collections.deque(maxlen=24)
+        self.imu_zero_frames = 0
+        self.imu_sane = True
         self.stop_event = threading.Event()
         self.rx_times = collections.deque(maxlen=1000)
         self.infer_times = collections.deque(maxlen=500)
@@ -109,6 +113,7 @@ class Controller:
         self.servo_reply_event = threading.Event()
         self.servo_expected_reply = None
         self._zeros_pushed = False
+        self._zeros_pushed_at = 0.0
         self._zeros_confirmed = False
         self._load_zeros()
 
@@ -135,6 +140,7 @@ class Controller:
     def _push_zeros(self):
         self.bridge.notify('duck_cal', encode_cal(CAL_SET_ZEROS, mask=ALL_MASK, raw=self.zero_pos))
         self._zeros_pushed = True
+        self._zeros_pushed_at = time.monotonic()
 
     def receive_boot_pd(self, raw):
         if not isinstance(raw, (bytes, bytearray)) or len(raw)!=32: return
@@ -148,8 +154,6 @@ class Controller:
         except ValueError:
             return
         with self.lock:
-            if not self._zeros_pushed:
-                self._push_zeros()
             self.raw_pos = pkt['pos']
             self.raw_mask = pkt['mask']
             # The packet that triggered the push predates its application on MCU.
@@ -158,6 +162,14 @@ class Controller:
                 self._zeros_confirmed = True
             if self._zeros_confirmed:
                 self.zero_pos = pkt['zero']
+            # A single push can be lost while the MCU is still booting or right
+            # after it resets, and the old one-shot flag never retried: the app
+            # then sat with zeros_confirmed=False forever and refused to stand.
+            # Retry once a second until the MCU echoes the same table. Never
+            # during calibration - it would overwrite the joint being set.
+            if (not self._zeros_confirmed and self.mode != 'calibrate'
+                    and time.monotonic() - self._zeros_pushed_at >= 1.0):
+                self._push_zeros()
 
     def receive_servo_reply(self, raw):
         try:
@@ -197,8 +209,18 @@ class Controller:
                 else:
                     self.gaps += step-1
                 self.rx_intervals.append((now-self.rx_time)*1000)
+            # A stuck IMU reports exact zeros on both acc and gyro while the
+            # packet stays "valid". Feeding that to the filter pins gravity at
+            # [0,0,-1], so tilt reads 0 forever and fall recovery never fires.
+            # Exact zeros cannot happen during a real fall (there is always
+            # gravity or noise), so they are a safe fault signature.
+            if not any(fb.acc) and not any(fb.gyro):
+                self.imu_zero_frames += 1
+            else:
+                self.imu_zero_frames = 0
+            self.imu_sane = bool(fb.imu_ok and self.imu_zero_frames < IMU_ZERO_LIMIT)
             self.filtered = self.filter.update(fb.acc, fb.gyro, fb.angles, fb.velocities,
-                timestamp=now, imu_ok=fb.imu_ok)
+                timestamp=now, imu_ok=fb.imu_ok and self.imu_sane)
             self.feedback, self.rx_time = fb, now
             self.received += 1; self.rx_times.append(now)
             if old and old.enabled and not fb.enabled and self.mode in ('hold', 'policy'):
@@ -644,6 +666,8 @@ class Controller:
                 lost = None
                 if not fb or age>.15 or not fb.imu_ok:
                     lost = 'sensor feedback lost; disarmed'
+                elif not self.imu_sane:
+                    lost = 'IMU reports all zeros; disarmed (sensor needs re-init)'
                 elif self.startup_pose_active and fb.mask != ALL_MASK:
                     lost = 'startup pose servo feedback lost; disarmed'
                 elif not self.startup_pose_active and self.gamepad_session is None and time.monotonic()-self.web_time > 1.0:
@@ -671,7 +695,7 @@ class Controller:
                         self.bridge.notify('duck_servo', encode_servo(SERVO_EXIT, 10))
                     self._disarm_now()
             twist, head, mouth = list(self.twist), list(self.head), self.mouth
-            valid = bool(fb and age < .15 and fb.imu_ok and filt
+            valid = bool(fb and age < .15 and fb.imu_ok and self.imu_sane and filt
                          and filt['imu_fusion_ready'] and filt['imu_fusion_updated'])
             now = time.monotonic()
             if self.roulade_until and now >= self.roulade_until:
@@ -870,6 +894,8 @@ class Controller:
                 ready=self.startup_pose_ready(), active=self.startup_pose_active,
                 settle_s=STARTUP_POSE_SETTLE_S, zeros_confirmed=self._zeros_confirmed)
             result['error_history'] = list(self.event_log)
+            result['imu_sane'] = self.imu_sane
+            result['imu_zero_frames'] = self.imu_zero_frames
             result['board_gamepad'] = dict(active=self.gamepad_session is not None,
                 device=self.gamepad_device,
                 age_ms=(now-self.gamepad_time)*1000 if self.gamepad_time else None,

@@ -125,6 +125,23 @@ static bool updateImu() {
   int16_t gy_raw = (int16_t)(data[9] << 8 | data[8]);
   int16_t gz_raw = (int16_t)(data[11] << 8 | data[10]);
 
+  // A powered QMI8658 always measures gravity, so an all-zero acc AND gyro frame
+  // cannot be a real reading. It means the part reset to its defaults
+  // (CTRL7 = 0, sensors off) or the bus returned junk. The old code published
+  // those zeros as valid, which froze the host gravity filter at [0, 0, -1]:
+  // tilt then read 0 deg forever and fall recovery never fired. Drop the address
+  // so the 1 s probe path re-configures the sensor instead.
+  if (ax_raw == 0 && ay_raw == 0 && az_raw == 0 &&
+      gx_raw == 0 && gy_raw == 0 && gz_raw == 0) {
+    static uint16_t zeroSamples = 0;
+    if (++zeroSamples >= 25) {  // 0.25 s at 100 Hz
+      zeroSamples = 0;
+      imu.ok = 0;
+      qmiAddr = 0;
+    }
+    return false;
+  }
+
   int16_t accx = az_raw;
   int16_t accy = ax_raw;
   int16_t accz = (int16_t)(-ay_raw);
