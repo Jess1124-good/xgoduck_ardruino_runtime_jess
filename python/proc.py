@@ -2,16 +2,26 @@
 from __future__ import annotations
 import math
 import time
-from rl_core import State, ImuFilter, FEEDBACK_PERIOD, VEL_ALPHA, GYRO_ALPHA
+from rl_core import State, ImuFilter, FEEDBACK_PERIOD, VEL_ALPHA, GYRO_ALPHA, IMU_BIAS_DEG
 
 class SignalFilter:
     def __init__(self):
         self.gyro_alpha = GYRO_ALPHA
         self.vel_alpha = VEL_ALPHA
+        self.imu_bias_deg = tuple(IMU_BIAS_DEG)
+        self.gyro_bias_dps = (0.0, 0.0, 0.0)
         self.reset()
 
+    def set_calibration(self, imu_bias_deg, gyro_bias_dps):
+        """Forward the measured mounting tilt and gyro zero bias to the live filter."""
+        self.imu_bias_deg = tuple(float(v) for v in imu_bias_deg)
+        self.gyro_bias_dps = tuple(float(v) for v in gyro_bias_dps)
+        self._imu.set_calibration(self.imu_bias_deg, self.gyro_bias_dps)
+
     def reset(self):
-        self._imu = ImuFilter(self.gyro_alpha, self.vel_alpha)
+        self._imu = ImuFilter(self.gyro_alpha, self.vel_alpha,
+                              imu_bias_deg=self.imu_bias_deg,
+                              gyro_bias_dps=self.gyro_bias_dps)
         self._last_t = None
         self._last = None
 

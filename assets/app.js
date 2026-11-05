@@ -9,6 +9,7 @@ document.querySelectorAll('[data-mode]').forEach(b=>b.onclick=()=>setMode(b.data
 $('pick').onclick=async()=>{try{const r=await post('pick',{});$('message').textContent=`Pick started · ${r.model}`;}catch(e){showError(e);}};
 $('roulade').onclick=async()=>{try{const r=await post('roulade',{});$('message').textContent=`Roulade · ${r.model}`;}catch(e){showError(e);}};
 $('walk-slot').onchange=async()=>{const want=$('walk-slot').value;try{const r=await post('walk_model',{slot:want});$('message').textContent=`Walk slot ${r.slot} · ${r.model}`;}catch(e){showError(e);$('walk-slot').value='main';}};
+$('imu-cal').onclick=async()=>{$('message').textContent='Calibrating IMU — hold the duck still in Default pose';try{const r=await post('imu/calibrate',{});$('message').textContent=`IMU calibrated · roll ${r.imu_bias_deg[0].toFixed(1)}° pitch ${r.imu_bias_deg[1].toFixed(1)}° · gyro [${r.gyro_bias_dps.join(', ')}] °/s · ${r.samples} samples`;}catch(e){showError(e);}};
 fetch('/api/status').then(r=>r.json()).then(s=>{if(s.walk_model)$('walk-slot').value=s.walk_model.slot;}).catch(()=>{});
 $('stop').onclick=()=>{zero();setMode('off')};
 const keys=new Set(), sticks={left:{x:0,y:0},right:{x:0,y:0}}, resetSticks=[];

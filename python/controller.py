@@ -2,6 +2,7 @@
 import collections
 import json
 import math
+import statistics
 import threading
 import time
 import uuid
@@ -18,6 +19,14 @@ FACTORY_ZERO = [
     2550, 2060, 2128, 2034, 2190,
 ]
 ZERO_PATH = Path(__file__).resolve().parents[1] / 'data' / 'zero_pos.json'
+IMU_CAL_PATH = Path(__file__).resolve().parents[1] / 'data' / 'imu_cal.json'
+# Long enough to average out servo jitter, short enough to stay inside one stand.
+IMU_CAL_SECONDS = 2.5
+IMU_CAL_MIN_SAMPLES = 50
+IMU_CAL_MAX_GYRO_STD = 0.8   # deg/s
+IMU_CAL_MAX_ACC_STD = 0.35   # m/s^2
+IMU_CAL_MIN_G = 7.0          # m/s^2: reject a free-fall or a dead sensor
+IMU_CAL_MAX_G = 12.5
 EXCLUSIVE_MODES = ('calibrate', 'servo_debug')
 PICK_PERIOD_S = 4.0
 PICK_MOUTH_CLOSE_PHI = 0.4
@@ -116,6 +125,8 @@ class Controller:
         self._zeros_pushed_at = 0.0
         self._zeros_confirmed = False
         self._load_zeros()
+        self.imu_cal = {}
+        self._load_imu_cal()
 
     def _load_zeros(self):
         try:
@@ -141,6 +152,86 @@ class Controller:
         self.bridge.notify('duck_cal', encode_cal(CAL_SET_ZEROS, mask=ALL_MASK, raw=self.zero_pos))
         self._zeros_pushed = True
         self._zeros_pushed_at = time.monotonic()
+
+    def _load_imu_cal(self):
+        try:
+            data = json.loads(IMU_CAL_PATH.read_text(encoding='utf-8'))
+            bias = [float(v) for v in data['imu_bias_deg']]
+            gyro = [float(v) for v in data['gyro_bias_dps']]
+            if len(bias) != 3 or len(gyro) != 3:
+                return
+            if not all(math.isfinite(v) for v in bias + gyro):
+                return
+            self.imu_cal = dict(data, imu_bias_deg=bias, gyro_bias_dps=gyro)
+            self.filter.set_calibration(bias, gyro)
+            self.filter.reset()
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+
+    def calibrate_imu(self, seconds=IMU_CAL_SECONDS):
+        """Measure the gyro zero bias and the gravity mounting tilt in the default pose.
+
+        The robot must be standing in Default pose (hold, torque on) on a level
+        surface. The result is persisted to data/imu_cal.json and applied at once.
+        """
+        with self.lock:
+            fb = self.feedback
+            if self.mode != 'hold' or not (fb and fb.enabled):
+                raise ValueError('IMU calibration needs the default pose: hold mode with torque on')
+            if not (fb.imu_ok and self.imu_sane):
+                raise ValueError('IMU is not reporting usable data')
+
+        acc, gyro = [], []
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            with self.lock:
+                fb = self.feedback
+            if fb and fb.imu_ok:
+                acc.append(tuple(fb.acc))
+                gyro.append(tuple(fb.gyro))
+            time.sleep(0.01)
+
+        if len(acc) < IMU_CAL_MIN_SAMPLES:
+            raise ValueError(f'only {len(acc)} IMU samples collected; is feedback alive?')
+
+        def mean_std(rows):
+            means = [statistics.mean(r[i] for r in rows) for i in range(3)]
+            stds = [statistics.pstdev(r[i] for r in rows) for i in range(3)]
+            return means, stds
+
+        acc_mean, acc_std = mean_std(acc)
+        gyro_mean, gyro_std = mean_std(gyro)
+        if max(gyro_std) > IMU_CAL_MAX_GYRO_STD or max(acc_std) > IMU_CAL_MAX_ACC_STD:
+            raise ValueError('robot is not still: gyro std %.2f deg/s, acc std %.2f m/s2'
+                             % (max(gyro_std), max(acc_std)))
+
+        ax, ay, az = acc_mean
+        magnitude = math.sqrt(ax * ax + ay * ay + az * az)
+        if not (IMU_CAL_MIN_G < magnitude < IMU_CAL_MAX_G):
+            raise ValueError('acc magnitude %.1f m/s2 is not 1 g' % magnitude)
+
+        # Rotations that put the measured gravity on [0, 0, -1], matching the
+        # order used by rl_core._rotate_imu_bias (yaw is unobservable).
+        pitch = math.degrees(math.atan2(ax, -az))
+        roll = math.degrees(math.atan(-ay / math.sqrt(ax * ax + az * az)))
+
+        calibration = dict(
+            imu_bias_deg=[round(roll, 3), round(pitch, 3), 0.0],
+            gyro_bias_dps=[round(v, 3) for v in gyro_mean],
+            acc_mean=[round(v, 3) for v in acc_mean],
+            acc_g=round(magnitude / 9.80665, 4),
+            gyro_std_dps=round(max(gyro_std), 3),
+            acc_std_ms2=round(max(acc_std), 3),
+            samples=len(acc),
+            saved_at=time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+        )
+        with self.lock:
+            self.imu_cal = calibration
+            self.filter.set_calibration(calibration['imu_bias_deg'], calibration['gyro_bias_dps'])
+            self.filter.reset()
+            IMU_CAL_PATH.parent.mkdir(parents=True, exist_ok=True)
+            IMU_CAL_PATH.write_text(json.dumps(calibration, indent=2), encoding='utf-8')
+        return calibration
 
     def receive_boot_pd(self, raw):
         if not isinstance(raw, (bytes, bytearray)) or len(raw)!=32: return
@@ -896,6 +987,7 @@ class Controller:
             result['error_history'] = list(self.event_log)
             result['imu_sane'] = self.imu_sane
             result['imu_zero_frames'] = self.imu_zero_frames
+            result['imu_cal'] = self.imu_cal
             result['board_gamepad'] = dict(active=self.gamepad_session is not None,
                 device=self.gamepad_device,
                 age_ms=(now-self.gamepad_time)*1000 if self.gamepad_time else None,

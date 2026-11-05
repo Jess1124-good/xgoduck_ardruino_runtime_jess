@@ -67,9 +67,9 @@ class State:
     grav: List[float] = field(default_factory=lambda: [0.0, 0.0, -1.0])
     gyro_rad: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
 
-def _rotate_imu_bias(vec: List[float]) -> List[float]:
-    """Rotate an IMU vector to cancel IMU_BIAS_DEG. Identity when the bias is zero."""
-    roll, pitch, yaw = IMU_BIAS_DEG
+def _rotate_imu_bias(vec: List[float], bias=IMU_BIAS_DEG) -> List[float]:
+    """Rotate an IMU vector to cancel the mounting bias. Identity when the bias is zero."""
+    roll, pitch, yaw = bias
     if roll == 0.0 and pitch == 0.0 and yaw == 0.0:
         return vec
     r, p, y = math.radians(roll), math.radians(pitch), math.radians(yaw)
@@ -87,18 +87,32 @@ def _rotate_imu_bias(vec: List[float]) -> List[float]:
 
 
 class ImuFilter:
-    """Body-frame gravity: gyro prediction plus accel-magnitude-weighted correction. No bias estimate."""
+    """Body-frame gravity: gyro prediction plus accel-magnitude-weighted correction.
 
-    def __init__(self, gyro_alpha: float = GYRO_ALPHA, vel_alpha: float = VEL_ALPHA) -> None:
+    Two calibration terms are applied before the filter runs, both measured on the
+    robot in its default pose:
+      imu_bias_deg   mounting tilt that rotates standing gravity onto [0, 0, -1]
+      gyro_bias_dps  constant rate offset subtracted from every gyro sample
+    """
+
+    def __init__(self, gyro_alpha: float = GYRO_ALPHA, vel_alpha: float = VEL_ALPHA,
+                 imu_bias_deg=IMU_BIAS_DEG,
+                 gyro_bias_dps=(0.0, 0.0, 0.0)) -> None:
         self.gyro_alpha = gyro_alpha
         self.vel_alpha = vel_alpha
+        self.set_calibration(imu_bias_deg, gyro_bias_dps)
         self._gravity: Optional[List[float]] = None
         self._gyro: Optional[List[float]] = None
         self._vel: Optional[List[float]] = None
 
+    def set_calibration(self, imu_bias_deg, gyro_bias_dps) -> None:
+        self.imu_bias_deg = tuple(float(v) for v in imu_bias_deg)
+        self.gyro_bias_dps = tuple(float(v) for v in gyro_bias_dps)
+
     def update(self, st: State, dt: float = FEEDBACK_PERIOD) -> State:
-        acc_n = _rotate_imu_bias([st.acc[2], -st.acc[0], -st.acc[1]])
-        gyro_n = _rotate_imu_bias([st.gyro[2], -st.gyro[0], -st.gyro[1]])
+        acc_n = _rotate_imu_bias([st.acc[2], -st.acc[0], -st.acc[1]], self.imu_bias_deg)
+        gyro_n = _rotate_imu_bias([st.gyro[2], -st.gyro[0], -st.gyro[1]], self.imu_bias_deg)
+        gyro_n = [v - b for v, b in zip(gyro_n, self.gyro_bias_dps)]
         norm = math.sqrt(sum(v * v for v in acc_n))
         acc_unit = [v / norm for v in acc_n] if norm > 1e-6 else None
         # Large gaps cannot be reconstructed from a single angular-rate sample.

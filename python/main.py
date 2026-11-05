@@ -30,6 +30,10 @@ def walk_model(body: dict):
     try: return controller.set_walk_slot(body['slot'])
     except (KeyError, TypeError, ValueError) as exc: raise HTTPException(400, str(exc))
 
+def imu_calibrate(_body: dict = None):
+    try: return controller.calibrate_imu()
+    except ValueError as exc: raise HTTPException(400, str(exc))
+
 def filtering(body: dict):
     try:
         leg, head = controller.set_action_alphas(**body)
@@ -82,6 +86,7 @@ ui.expose_api('POST', '/api/mode', mode)
 ui.expose_api('POST', '/api/command', command)
 ui.expose_api('POST', '/api/gamepad', gamepad)
 ui.expose_api('POST', '/api/walk_model', walk_model)
+ui.expose_api('POST', '/api/imu/calibrate', imu_calibrate)
 ui.expose_api('POST', '/api/filter', filtering)
 ui.expose_api('POST', '/api/pick', pick)
 ui.expose_api('POST', '/api/roulade', roulade)
