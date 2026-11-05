@@ -18,10 +18,13 @@ class SignalFilter:
         self.gyro_bias_dps = tuple(float(v) for v in gyro_bias_dps)
         self._imu.set_calibration(self.imu_bias_deg, self.gyro_bias_dps)
 
+    def _new_filter(self):
+        return ImuFilter(self.gyro_alpha, self.vel_alpha,
+                         imu_bias_deg=self.imu_bias_deg,
+                         gyro_bias_dps=self.gyro_bias_dps)
+
     def reset(self):
-        self._imu = ImuFilter(self.gyro_alpha, self.vel_alpha,
-                              imu_bias_deg=self.imu_bias_deg,
-                              gyro_bias_dps=self.gyro_bias_dps)
+        self._imu = self._new_filter()
         self._last_t = None
         self._last = None
 
@@ -40,7 +43,10 @@ class SignalFilter:
             return out
         dt = FEEDBACK_PERIOD if self._last_t is None else now - self._last_t
         if self._last_t is None:
-            self._imu = ImuFilter(self.gyro_alpha, self.vel_alpha)
+            # First sample after a reset: rebuild rather than reuse, but keep the
+            # measured mounting tilt and gyro zero bias (dropping them here made
+            # a successful calibration silently do nothing).
+            self._imu = self._new_filter()
         self._last_t = now
         # QMI firmware already outputs policy body axes. Invert the ESP32 Python
         # mapping [z,-x,-y] here so ImuFilter applies it exactly once overall.
