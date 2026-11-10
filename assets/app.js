@@ -5,7 +5,7 @@ $('head-controls').insertAdjacentHTML('beforeend','<label>Mouth 34 (°)<input id
 // A stalled request must never wedge the 50 ms heartbeat loop: sendCommand()
 // holds commandBusy until this promise settles, and the runtime disarms after
 // 1 s without a heartbeat. Without a timeout one slow fetch drops the duck.
-async function post(path, body, timeoutMs = 800){
+async function post(path, body, timeoutMs = 2000){
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeoutMs);
   try{
@@ -68,7 +68,7 @@ async function sendCommand(){
   if(commandBusy){commandPending=true;return;}
   commandBusy=true;commandPending=false;
   try{await post('command',{twist:[...motion],head:[0,1,2,3].map(i=>+$('head'+i).value),mouth:+$('mouth').value});}
-  catch(e){if(gamepad.enabled)resetMotion();showError(e);}
+  catch(e){if(e.name==='AbortError'){/* 网络慢，跳过这一拍，下一拍补心跳，不清零动作 */}else{if(gamepad.enabled)resetMotion();showError(e);}}
   finally{commandBusy=false;if(commandPending)sendCommand();}
 }
 function joystick(id,side){
@@ -104,7 +104,7 @@ window.addEventListener('keyup',e=>{const k=e.key.toLowerCase();if(keys.delete(k
 window.addEventListener('blur',()=>{zero();if(gamepad.enabled&&!boardControl)setMode('off');});
 document.addEventListener('visibilitychange',()=>{if(document.hidden){keys.clear();zero();post('mode',{mode:'off',page_exit:true}).catch(()=>{});}});
 window.addEventListener('pagehide',()=>navigator.sendBeacon('/api/mode',new Blob([JSON.stringify({mode:'off',page_exit:true})],{type:'application/json'})));
-setInterval(()=>{if(!document.hidden&&!commandBusy)sendCommand();},50);
+setInterval(()=>{if(!document.hidden&&!commandBusy)sendCommand();},100);
 setInterval(async()=>{if(statusBusy||document.hidden)return;statusBusy=true;try{const ac=new AbortController();const tm=setTimeout(()=>ac.abort(),2500);const r=await fetch('/api/status',{signal:ac.signal}).finally(()=>clearTimeout(tm));if(!r.ok)throw new Error('status read failed');const s=await r.json();const modeLabel={shadow:'inference only',off:'torque off',hold:'default pose',policy:'walk',calibrate:'calibrate',servo_debug:'servo setup'};$('rx').textContent=s.feedback_hz.toFixed(1)+' Hz';$('rl').textContent=s.inference_hz.toFixed(1)+' Hz';$('servos').textContent=(s.servo_ids?.length||0)+'/15';$('imu').textContent=s.imu_ok?'online':'offline';$('mode').textContent=(modeLabel[s.mode]||s.mode)+(s.enabled?' · enabled':' · torque off');$('message').textContent=s.last_error||`Bridge ${(s.bridge_baud/1e6).toFixed(0)} Mbps · state age ${(s.feedback_age_ms||0).toFixed(1)} ms`;
 document.querySelectorAll('[data-mode="hold"],[data-mode="policy"]').forEach(b=>b.disabled=!s.control_ready);
 const recovery=s.recovery, pick=s.pick, roulade=s.roulade;
@@ -125,4 +125,4 @@ if(pick&&pick.active)$('mouth').value=Math.round(s.mouth||0);}
 for(const [id,values]of [['acc-values',s.acc],['gyro-values',s.gyro],['gravity-values',s.gravity]])$(id).textContent=values?values.map(x=>x.toFixed(3)).join(' / '):'—';
 $('command-health').textContent=`sent ${s.sent} · MCU echo ${s.mcu_command_seq??'—'} · command age ${s.mcu_command_age_us<1e9?(s.mcu_command_age_us/1000).toFixed(1)+' ms':'—'} · gaps ${s.sequence_gaps} · rejected ${s.mcu_invalid_commands??0}`;
 if(s.angles)$('joints').innerHTML=s.motors.map((id,i)=>`<tr class="${s.servo_ids.includes(id)?'':'missing'}"><td>${id}</td><td>${s.angles[i].toFixed(1)}</td><td>${s.targets[i].toFixed(1)}</td></tr>`).join('');
-}catch(e){showError(e);}finally{statusBusy=false;}},250);
+}catch(e){showError(e);}finally{statusBusy=false;}},500);
