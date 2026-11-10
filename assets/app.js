@@ -2,7 +2,22 @@ const $=id=>document.getElementById(id);
 let statusBusy=false, commandBusy=false, commandPending=false;
 for(let i=0;i<4;i++) $('head-controls').insertAdjacentHTML('beforeend',`<label>head ${i+1}<input id="head${i}" type="range" min="-1" max="1" value="0" step="0.02"></label>`);
 $('head-controls').insertAdjacentHTML('beforeend','<label>Mouth 34 (°)<input id="mouth" type="range" min="0" max="30" value="0" step="1"></label>');
-async function post(path, body){const r=await fetch('/api/'+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const x=await r.json();if(!r.ok)throw new Error(x.detail||'request failed');return x;}
+// A stalled request must never wedge the 50 ms heartbeat loop: sendCommand()
+// holds commandBusy until this promise settles, and the runtime disarms after
+// 1 s without a heartbeat. Without a timeout one slow fetch drops the duck.
+async function post(path, body, timeoutMs = 800){
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  try{
+    const r = await fetch('/api/' + path, {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(body), signal: ac.signal});
+    const x = await r.json();
+    if(!r.ok) throw new Error(x.detail || 'request failed');
+    return x;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 function showError(e){$('message').textContent=e.message;}
 async function setMode(mode){if(gamepad.enabled)resetMotion();try{await post('mode',{mode});$('message').textContent='Mode updated';}catch(e){showError(e);}}
 document.querySelectorAll('[data-mode]').forEach(b=>b.onclick=()=>setMode(b.dataset.mode));
@@ -90,7 +105,7 @@ window.addEventListener('blur',()=>{zero();if(gamepad.enabled&&!boardControl)set
 document.addEventListener('visibilitychange',()=>{if(document.hidden){keys.clear();zero();post('mode',{mode:'off',page_exit:true}).catch(()=>{});}});
 window.addEventListener('pagehide',()=>navigator.sendBeacon('/api/mode',new Blob([JSON.stringify({mode:'off',page_exit:true})],{type:'application/json'})));
 setInterval(()=>{if(!document.hidden&&!commandBusy)sendCommand();},50);
-setInterval(async()=>{if(statusBusy||document.hidden)return;statusBusy=true;try{const r=await fetch('/api/status');if(!r.ok)throw new Error('status read failed');const s=await r.json();const modeLabel={shadow:'inference only',off:'torque off',hold:'default pose',policy:'walk',calibrate:'calibrate',servo_debug:'servo setup'};$('rx').textContent=s.feedback_hz.toFixed(1)+' Hz';$('rl').textContent=s.inference_hz.toFixed(1)+' Hz';$('servos').textContent=(s.servo_ids?.length||0)+'/15';$('imu').textContent=s.imu_ok?'online':'offline';$('mode').textContent=(modeLabel[s.mode]||s.mode)+(s.enabled?' · enabled':' · torque off');$('message').textContent=s.last_error||`Bridge ${(s.bridge_baud/1e6).toFixed(0)} Mbps · state age ${(s.feedback_age_ms||0).toFixed(1)} ms`;
+setInterval(async()=>{if(statusBusy||document.hidden)return;statusBusy=true;try{const ac=new AbortController();const tm=setTimeout(()=>ac.abort(),2500);const r=await fetch('/api/status',{signal:ac.signal}).finally(()=>clearTimeout(tm));if(!r.ok)throw new Error('status read failed');const s=await r.json();const modeLabel={shadow:'inference only',off:'torque off',hold:'default pose',policy:'walk',calibrate:'calibrate',servo_debug:'servo setup'};$('rx').textContent=s.feedback_hz.toFixed(1)+' Hz';$('rl').textContent=s.inference_hz.toFixed(1)+' Hz';$('servos').textContent=(s.servo_ids?.length||0)+'/15';$('imu').textContent=s.imu_ok?'online':'offline';$('mode').textContent=(modeLabel[s.mode]||s.mode)+(s.enabled?' · enabled':' · torque off');$('message').textContent=s.last_error||`Bridge ${(s.bridge_baud/1e6).toFixed(0)} Mbps · state age ${(s.feedback_age_ms||0).toFixed(1)} ms`;
 document.querySelectorAll('[data-mode="hold"],[data-mode="policy"]').forEach(b=>b.disabled=!s.control_ready);
 const recovery=s.recovery, pick=s.pick, roulade=s.roulade;
 const boardActive=s.input_source==='board_gamepad';
